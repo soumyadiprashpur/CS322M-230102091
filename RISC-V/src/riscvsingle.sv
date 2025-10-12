@@ -1,169 +1,348 @@
-// src/riscvsingle.sv
-// NOTE: This is a representative example of how the core files would be modified.
-// It assumes a baseline single-cycle RISC-V core structure.
+// RISC-V single-cycle processor with RVX10 extension
+// Original from Section 7.6 of Digital Design & Computer Architecture
+// David_Harris@hmc.edu, Sarah.Harris@unlv.edu
+//
+// Modified to include 10 new RVX10 instructions as per the assignment.
+// These instructions use the CUSTOM-0 opcode (0001011).
 
-// ===================================================================
-// 1. ALU Definitions (e.g., in a package or defines file)
-// ===================================================================
-[cite_start]// Add new ALU operation codes for RVX10 instructions [cite: 37]
-typedef enum logic [4:0] {
-    ALU_ADD,
-    ALU_SUB,
-    ALU_SLL,
-    // ... other standard ALU ops
-    ALU_ANDN, // RVX10
-    ALU_ORN,  // RVX10
-    ALU_XNOR, // RVX10
-    ALU_MIN,  // RVX10
-    ALU_MAX,  // RVX10
-    ALU_MINU, // RVX10
-    ALU_MAXU, // RVX10
-    ALU_ROL,  // RVX10
-    ALU_ROR,  // RVX10
-    ALU_ABS   // RVX10
-} alu_op_t;
+// run 210
+// Expect simulator to print "Simulation succeeded"
+// when the value 25 (0x19) is written to address 100 (0x64)
 
+module testbench();
 
-// ===================================================================
-// 2. Decode Logic Modification
-// ===================================================================
-// In the main control/decode module...
-module decoder (
-    input  logic [31:0] inst,
-    output alu_op_t     alu_op,
-    // ... other control signals (reg_write_en, mem_read_en, etc.)
+  logic        clk;
+  logic        reset;
+
+  logic [31:0] WriteData, DataAdr;
+  logic        MemWrite;
+
+  // instantiate device to be tested
+  top dut(clk, reset, WriteData, DataAdr, MemWrite);
+  
+   initial begin
+    $dumpfile("wave.vcd");
+    $dumpvars(0, testbench);
+  end
+
+  // initialize test
+  initial
+    begin
+      reset <= 1; # 22; reset <= 0;
+    end
+
+  // generate clock to sequence tests
+  always
+    begin
+      clk <= 1; # 5; clk <= 0; # 5;
+    end
+
+  // check results
+  always @(negedge clk)
+    begin
+      if(MemWrite) begin
+        if(DataAdr === 100 && WriteData === 25) begin
+          $display("Simulation succeeded");
+
+        end 
+      end
+    end
+endmodule
+
+module top(input  logic        clk, reset, 
+           output logic [31:0] WriteData, DataAdr, 
+           output logic        MemWrite);
+
+  logic [31:0] PC, Instr, ReadData;
+  
+  // instantiate processor and memories
+  riscvsingle rvsingle(clk, reset, PC, Instr, MemWrite, DataAdr, 
+                      WriteData, ReadData);
+  imem imem(PC, Instr);
+  dmem dmem(clk, MemWrite, DataAdr, WriteData, ReadData);
+endmodule
+
+module riscvsingle(input  logic        clk, reset,
+                   output logic [31:0] PC,
+                   input  logic [31:0] Instr,
+                   output logic        MemWrite,
+                   output logic [31:0] ALUResult, WriteData,
+                   input  logic [31:0] ReadData);
+
+  logic       ALUSrc, RegWrite, Jump, Zero, PCSrc;
+  logic [1:0] ResultSrc, ImmSrc;
+  logic [3:0] ALUControl; // Changed from [2:0] to [3:0] for new instructions
+
+  controller c(Instr[6:0], Instr[14:12], Instr[31:25], Zero, // Pass full funct7
+               ResultSrc, MemWrite, PCSrc,
+               ALUSrc, RegWrite, Jump,
+               ImmSrc, ALUControl);
+  datapath dp(clk, reset, ResultSrc, PCSrc,
+              ALUSrc, RegWrite,
+              ImmSrc, ALUControl,
+              Zero, PC, Instr,
+              ALUResult, WriteData, ReadData);
+endmodule
+
+module controller(input  logic [6:0] op,
+                  input  logic [2:0] funct3,
+                  input  logic [6:0] funct7, // Changed from funct7b5 to full funct7
+                  input  logic       Zero,
+                  output logic [1:0] ResultSrc,
+                  output logic       MemWrite,
+                  output logic       PCSrc, ALUSrc,
+                  output logic       RegWrite, Jump,
+                  output logic [1:0] ImmSrc,
+                  output logic [3:0] ALUControl); // Changed to [3:0]
+
+  logic [1:0] ALUOp;
+  logic       Branch;
+
+  maindec md(op, ResultSrc, MemWrite, Branch,
+             ALUSrc, RegWrite, Jump, ImmSrc, ALUOp);
+  aludec  ad(op, funct3, funct7, ALUOp, ALUControl); // Pass op and funct7
+
+  assign PCSrc = Branch & Zero | Jump;
+endmodule
+
+module maindec(input  logic [6:0] op,
+               output logic [1:0] ResultSrc,
+               output logic       MemWrite,
+               output logic       Branch, ALUSrc,
+               output logic       RegWrite, Jump,
+               output logic [1:0] ImmSrc,
+               output logic [1:0] ALUOp);
+
+  logic [10:0] controls;
+
+  assign {RegWrite, ImmSrc, ALUSrc, MemWrite,
+          ResultSrc, Branch, ALUOp, Jump} = controls;
+
+  always_comb
+    case(op)
+      // RegWrite_ImmSrc_ALUSrc_MemWrite_ResultSrc_Branch_ALUOp_Jump
+      7'b0000011: controls = 11'b1_00_1_0_01_0_00_0; // lw
+      7'b0100011: controls = 11'b0_01_1_1_00_0_00_0; // sw
+      7'b0110011: controls = 11'b1_xx_0_0_00_0_10_0; // R-type 
+      7'b1100011: controls = 11'b0_10_0_0_00_1_01_0; // beq
+      7'b0010011: controls = 11'b1_00_1_0_00_0_10_0; // I-type ALU
+      7'b1101111: controls = 11'b1_11_0_0_10_0_00_1; // jal
+      7'b0001011: controls = 11'b1_xx_0_0_00_0_11_0; // RVX10 Custom-0 (new)
+      default:    controls = 11'bx_xx_x_x_xx_x_xx_x; // non-implemented
+    endcase
+endmodule
+
+module aludec(input  logic [6:0] op,
+              input  logic [2:0] funct3,
+              input  logic [6:0] funct7, 
+              input  logic [1:0] ALUOp,
+              output logic [3:0] ALUControl);
+
+  always_comb
+    case(ALUOp)
+      2'b00: ALUControl = 4'b0000; // lw/sw: add
+      2'b01: ALUControl = 4'b0001; // beq: subtract
+      2'b10: // R-type or I-type ALU
+        case(funct3)
+          3'b000: if (op[5] && funct7[5]) ALUControl = 4'b0001; // sub
+                  else                   ALUControl = 4'b0000; // add, addi
+          3'b010: ALUControl = 4'b0100; // slt, slti
+          3'b110: ALUControl = 4'b0011; // or, ori
+          3'b111: ALUControl = 4'b0010; // and, andi
+          default: ALUControl = 4'bxxxx;
+        endcase
+      2'b11: // RVX10 Custom-0 Instructions
+        case(funct7)
+          7'b0000000: case(funct3)
+            3'b000: ALUControl = 4'b0101; // ANDN
+            3'b001: ALUControl = 4'b0110; // ORN
+            3'b010: ALUControl = 4'b0111; // XNOR
+            default: ALUControl = 4'bxxxx;
+          endcase
+          7'b0000001: case(funct3)
+            3'b000: ALUControl = 4'b1000; // MIN
+            3'b001: ALUControl = 4'b1001; // MAX
+            3'b010: ALUControl = 4'b1010; // MINU
+            3'b011: ALUControl = 4'b1011; // MAXU
+            default: ALUControl = 4'bxxxx;
+          endcase
+          7'b0000010: case(funct3)
+            3'b000: ALUControl = 4'b1100; // ROL
+            3'b001: ALUControl = 4'b1101; // ROR
+            default: ALUControl = 4'bxxxx;
+          endcase
+          7'b0000011: case(funct3)
+            3'b000: ALUControl = 4'b1110; // ABS
+            default: ALUControl = 4'bxxxx;
+          endcase
+          default: ALUControl = 4'bxxxx;
+        endcase
+      default: ALUControl = 4'bxxxx; // ???
+    endcase
+endmodule
+
+module datapath(input  logic        clk, reset,
+                input  logic [1:0]  ResultSrc, 
+                input  logic        PCSrc, ALUSrc,
+                input  logic        RegWrite,
+                input  logic [1:0]  ImmSrc,
+                input  logic [3:0]  ALUControl, // Changed to [3:0]
+                output logic        Zero,
+                output logic [31:0] PC,
+                input  logic [31:0] Instr,
+                output logic [31:0] ALUResult, WriteData,
+                input  logic [31:0] ReadData);
+
+  logic [31:0] PCNext, PCPlus4, PCTarget;
+  logic [31:0] ImmExt;
+  logic [31:0] SrcA, SrcB;
+  logic [31:0] Result;
+
+  // next PC logic
+  flopr #(32) pcreg(clk, reset, PCNext, PC); 
+  adder       pcadd4(PC, 32'd4, PCPlus4);
+  adder       pcaddbranch(PC, ImmExt, PCTarget);
+  mux2 #(32)  pcmux(PCPlus4, PCTarget, PCSrc, PCNext);
+ 
+  // register file logic
+  regfile     rf(clk, RegWrite, Instr[19:15], Instr[24:20], 
+                 Instr[11:7], Result, SrcA, WriteData);
+  extend      ext(Instr[31:7], ImmSrc, ImmExt);
+
+  // ALU logic
+  mux2 #(32)  srcbmux(WriteData, ImmExt, ALUSrc, SrcB);
+  alu         alu(SrcA, SrcB, ALUControl, ALUResult, Zero);
+  mux3 #(32)  resultmux(ALUResult, ReadData, PCPlus4, ResultSrc, Result);
+endmodule
+
+module regfile(input  logic        clk, 
+               input  logic        we3, 
+               input  logic [ 4:0] a1, a2, a3, 
+               input  logic [31:0] wd3, 
+               output logic [31:0] rd1, rd2);
+
+  logic [31:0] rf[31:0];
+
+  // three ported register file
+  // read two ports combinationally (A1/RD1, A2/RD2)
+  // write third port on rising edge of clock (A3/WD3/WE3)
+  // register 0 hardwired to 0
+
+  always_ff @(posedge clk)
+    if (we3 && (a3 != 5'd0)) rf[a3] <= wd3; 
+
+  assign rd1 = (a1 != 0) ? rf[a1] : 0;
+  assign rd2 = (a2 != 0) ? rf[a2] : 0;
+endmodule
+
+module adder(input  [31:0] a, b,
+             output [31:0] y);
+
+  assign y = a + b;
+endmodule
+
+module extend(
+    input  logic [31:7] instr,
+    input  logic [1:0]  immsrc,
+    output logic [31:0] immext
 );
 
-    // Instruction fields
-    logic [6:0] opcode = inst[6:0];
-    logic [2:0] funct3 = inst[14:12];
-    logic [6:0] funct7 = inst[31:25];
+  wire [11:0] itype  = instr[31:20];
+  wire [11:0] stype  = {instr[31:25], instr[11:7]};
+  wire [12:0] btype  = {instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
+  wire [20:0] jtype  = {instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
 
-    // Default control signal values
-    // ...
-
-    always_comb begin
-        // Set default values for control signals to deasserted
-        // ...
-
-        case (opcode)
-            // ... cases for standard RISC-V opcodes (LUI, AUIPC, JAL, etc.)
-
-            7'b0110011: begin // R-type standard
-                // ...
-            end
-
-            [cite_start]7'b0001011: begin // CUSTOM-0 for RVX10 [cite: 12]
-                // All RVX10 ops are ALU-to-RD, so enable register write-back
-                [cite_start]// and select ALU result as write-back data. [cite: 35, 70]
-                reg_write_en = 1'b1;
-                wb_mux_sel = WB_ALU; // Assuming a mux selector for write-back
-                [cite_start]// Deassert branch/memory controls [cite: 70]
-                branch_en = 1'b0;
-                mem_read_en = 1'b0;
-                mem_write_en = 1'b0;
-
-                case (funct7)
-                    [cite_start]7'b0000000: begin // ANDN, ORN, XNOR [cite: 25]
-                        case (funct3)
-                            3'b000: alu_op = ALU_ANDN;
-                            3'b001: alu_op = ALU_ORN;
-                            3'b010: alu_op = ALU_XNOR;
-                            default: alu_op = ALU_ADD; // Or some default/illegal op
-                        endcase
-                    end
-                    [cite_start]7'b0000001: begin // MIN, MAX, MINU, MAXU [cite: 25]
-                        case (funct3)
-                            3'b000: alu_op = ALU_MIN;
-                            3'b001: alu_op = ALU_MAX;
-                            3'b010: alu_op = ALU_MINU;
-                            3'b011: alu_op = ALU_MAXU;
-                            default: alu_op = ALU_ADD;
-                        endcase
-                    end
-                    [cite_start]7'b0000010: begin // ROL, ROR [cite: 25]
-                        case (funct3)
-                            3'b000: alu_op = ALU_ROL;
-                            3'b001: alu_op = ALU_ROR;
-                            default: alu_op = ALU_ADD;
-                        endcase
-                    end
-                    [cite_start]7'b0000011: begin // ABS [cite: 25]
-                        if (funct3 == 3'b000) begin
-                            alu_op = ALU_ABS;
-                        end else begin
-                            alu_op = ALU_ADD;
-                        end
-                    end
-                    default: alu_op = ALU_ADD;
-                endcase
-            end
-
-            // ... other standard opcode cases
-        endcase
-    end
+  assign immext = (immsrc == 2'b00) ? {{20{itype[11]}}, itype} :
+                  (immsrc == 2'b01) ? {{20{stype[11]}}, stype} :
+                  (immsrc == 2'b10) ? {{19{btype[12]}}, btype} :
+                  (immsrc == 2'b11) ? {{11{jtype[20]}}, jtype} :
+                                       32'bx;
 
 endmodule
 
 
-// ===================================================================
-// 3. ALU Implementation Modification
-// ===================================================================
-module alu (
-    input  logic [31:0] rs1_val,
-    input  logic [31:0] rs2_val,
-    input  alu_op_t     alu_op,
-    output logic [31:0] alu_result
+module flopr #(parameter WIDTH = 8)
+             (input  logic             clk, reset,
+              input  logic [WIDTH-1:0] d, 
+              output logic [WIDTH-1:0] q);
+
+  always_ff @(posedge clk, posedge reset)
+    if (reset) q <= 0;
+    else       q <= d;
+endmodule
+
+module mux2 #(parameter WIDTH = 8)
+            (input  logic [WIDTH-1:0] d0, d1, 
+             input  logic             s, 
+             output logic [WIDTH-1:0] y);
+
+  assign y = s ? d1 : d0; 
+endmodule
+
+module mux3 #(parameter WIDTH = 8)
+            (input  logic [WIDTH-1:0] d0, d1, d2,
+             input  logic [1:0]       s, 
+             output logic [WIDTH-1:0] y);
+
+  assign y = s[1] ? d2 : (s[0] ? d1 : d0); 
+endmodule
+
+module imem(input  logic [31:0] a,
+            output logic [31:0] rd);
+
+  logic [31:0] RAM[63:0];
+
+  initial
+      $readmemh("riscvtest.txt",RAM);
+
+  assign rd = RAM[a[31:2]]; // word aligned
+endmodule
+
+module dmem(input  logic        clk, we,
+            input  logic [31:0] a, wd,
+            output logic [31:0] rd);
+
+  logic [31:0] RAM[255:0]; // Increased dmem size
+
+  assign rd = RAM[a[31:2]]; // word aligned
+
+  always_ff @(posedge clk)
+    if (we) RAM[a[31:2]] <= wd;
+endmodule
+
+module alu(
+    input  logic [31:0] a, b,
+    input  logic [3:0]  alucontrol,
+    output logic [31:0] result,
+    output logic        zero
 );
 
-    [cite_start]// Signed versions of inputs for MIN/MAX/ABS [cite: 39-42]
-    wire signed [31:0] s1 = rs1_val;
-    wire signed [31:0] s2 = rs2_val;
-    logic [4:0] shamt = rs2_val[4:0]; [cite_start]// Shift/rotate amount [cite: 25]
+  logic [31:0] tmp;
+  logic signed [31:0] as, bs;
+  logic [4:0] shamt;
 
-    always_comb begin
-        case (alu_op)
-            // ... standard ALU ops
+  assign as = a;
+  assign bs = b;
+  assign shamt = b[4:0];
 
-            // RVX10 Implementations
-            [cite_start]ALU_ANDN: alu_result = rs1_val & ~rs2_val; [cite: 25, 46]
-            ALU_ORN:  alu_result = rs1_val | [cite_start]~rs2_val; [cite: 25, 48]
-            [cite_start]ALU_XNOR: alu_result = ~(rs1_val ^ rs2_val); [cite: 25, 50]
+  assign tmp = (alucontrol == 4'b0000) ? a + b :         // ADD
+               (alucontrol == 4'b0001) ? a - b :         // SUB
+               (alucontrol == 4'b0010) ? a & b :         // AND
+               (alucontrol == 4'b0011) ? a | b :         // OR
+               (alucontrol == 4'b0100) ? ((as < bs) ? 32'd1 : 32'd0) :
+               (alucontrol == 4'b0101) ? a & ~b :       // ANDN
+               (alucontrol == 4'b0110) ? a | ~b :       // ORN
+               (alucontrol == 4'b0111) ? ~(a ^ b) :     // XNOR
+               (alucontrol == 4'b1000) ? ((as < bs) ? a : b) :
+               (alucontrol == 4'b1001) ? ((as > bs) ? a : b) :
+               (alucontrol == 4'b1010) ? ((a < b) ? a : b) :
+               (alucontrol == 4'b1011) ? ((a > b) ? a : b) :
+               (alucontrol == 4'b1100) ? ((shamt==0)? a : (a << shamt) | (a >> (32-shamt))) :
+               (alucontrol == 4'b1101) ? ((shamt==0)? a : (a >> shamt) | (a << (32-shamt))) :
+               (alucontrol == 4'b1110) ? ((as >= 0)? a : -a) :
+               32'bx;
 
-            [cite_start]// Signed comparisons [cite: 25]
-            [cite_start]ALU_MIN: alu_result = (s1 < s2) ? rs1_val : rs2_val; [cite: 52]
-            [cite_start]ALU_MAX: alu_result = (s1 > s2) ? rs1_val : rs2_val; [cite: 55]
-
-            [cite_start]// Unsigned comparisons [cite: 25]
-            [cite_start]ALU_MINU: alu_result = (rs1_val < rs2_val) ? rs1_val : rs2_val; [cite: 56]
-            [cite_start]ALU_MAXU: alu_result = (rs1_val > rs2_val) ? rs1_val : rs2_val; [cite: 57]
-
-            // Rotate operations
-            ALU_ROL: begin
-                [cite_start]// Handle rotate by 0 explicitly to avoid shift by 32 [cite: 29]
-                if (shamt == 5'b0) begin
-                    alu_result = rs1_val;
-                end else begin
-                    alu_result = (rs1_val << shamt) | (rs1_val >> (32 - shamt)[cite_start]); [cite: 25, 60]
-                end
-            end
-            ALU_ROR: begin
-                [cite_start]// Handle rotate by 0 explicitly [cite: 29]
-                if (shamt == 5'b0) begin
-                    alu_result = rs1_val;
-                end else begin
-                    alu_result = (rs1_val >> shamt) | (rs1_val << (32 - shamt)[cite_start]); [cite: 25, 63]
-                end
-            end
-
-            // Absolute value
-            ALU_ABS: begin
-                [cite_start]// Handles two's complement INT_MIN correctly (ABS(0x80000000) -> 0x80000000) [cite: 30, 64]
-                alu_result = (s1 >= 0) ? rs1_val : -rs1_val;
-            end
-
-            default: alu_result = 32'b0;
-        endcase
-    end
+  assign result = tmp;
+  assign zero = (tmp == 32'b0);
 
 endmodule
